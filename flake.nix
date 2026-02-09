@@ -39,7 +39,7 @@
         default = self.nixosModules.bookshelf;
       };
 
-      overlays.default = final: prev: {
+      overlays.default = _final: prev: {
         bookshelf = self.packages.${prev.stdenv.hostPlatform.system}.bookshelf;
       };
     };
