@@ -1,0 +1,111 @@
+name: Update Bookshelf
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily at 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Get current rev
+        id: old
+        run: |
+          echo "rev=$(grep -oP '(?<=rev = ")[^"]+' package.nix)" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch latest commit from develop
+        id: new
+        run: |
+          LATEST=$(git ls-remote https://github.com/pennydreadful/bookshelf.git refs/heads/develop | cut -f1)
+          DATE=$(curl -sH "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/pennydreadful/bookshelf/commits/$LATEST" \
+            | jq -r '.commit.committer.date[:10]')
+          echo "rev=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+
+      - name: Check if update needed
+        id: check
+        run: |
+          if [ "${{ steps.old.outputs.rev }}" = "${{ steps.new.outputs.rev }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update source rev and version
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          NEW_REV="${{ steps.new.outputs.rev }}"
+          NEW_DATE="${{ steps.new.outputs.date }}"
+
+          # Update rev
+          sed -i "s|rev = \"[^\"]*\"|rev = \"${NEW_REV}\"|" package.nix
+
+          # Update version date
+          sed -i "s|version = \"0-unstable-[0-9-]*\"|version = \"0-unstable-${NEW_DATE}\"|" package.nix
+
+          # Invalidate source hash to get the new one
+          sed -i '/owner = "pennydreadful"/,/hash = /{s|hash = ".*"|hash = ""|;}' package.nix
+
+      - name: Get new source hash
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          set +e
+          OUTPUT=$(nix build .#bookshelf.src 2>&1)
+          HASH=$(echo "$OUTPUT" | grep -oP 'got:\s+\Ksha256-[A-Za-z0-9+/=]+')
+          set -e
+          if [ -z "$HASH" ]; then
+            echo "Failed to extract source hash"
+            echo "$OUTPUT"
+            exit 1
+          fi
+          sed -i "/owner = \"pennydreadful\"/,/hash = /{s|hash = \".*\"|hash = \"${HASH}\"|;}" package.nix
+
+      - name: Update yarn hash
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          # Invalidate yarn hash
+          sed -i '/yarnOfflineCache/,/hash = /{s|hash = ".*"|hash = ""|;}' package.nix
+
+          set +e
+          OUTPUT=$(nix build .#bookshelf 2>&1)
+          YARN_HASH=$(echo "$OUTPUT" | grep -oP 'got:\s+\Ksha256-[A-Za-z0-9+/=]+' | head -1)
+          set -e
+          if [ -n "$YARN_HASH" ]; then
+            sed -i "/yarnOfflineCache/,/hash = /{s|hash = \".*\"|hash = \"${YARN_HASH}\"|;}" package.nix
+          fi
+
+      - name: Regenerate deps.json
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          FETCH_DEPS=$(nix build .#bookshelf.fetch-deps --no-link --print-out-paths)
+          "$FETCH_DEPS" deps.json
+
+      - name: Verify build
+        if: steps.check.outputs.skip == 'false'
+        run: nix build .#bookshelf
+
+      - name: Create Pull Request
+        if: steps.check.outputs.skip == 'false'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "bookshelf: 0-unstable-${{ steps.new.outputs.date }}"
+          title: "bookshelf: update to ${{ steps.new.outputs.date }}"
+          body: |
+            Automated update of Bookshelf to commit `${{ steps.new.outputs.rev }}`.
+
+            [Diff](https://github.com/pennydreadful/bookshelf/compare/${{ steps.old.outputs.rev }}...${{ steps.new.outputs.rev }})
+          branch: auto-update/bookshelf
+          delete-branch: true
